@@ -42,9 +42,8 @@ cargo run -- --live
 ```
 
 Live mode requires `KUEST_PRIVATE_KEY`, `KUEST_DEPOSIT_WALLET`, and
-`KUEST_CHAIN_ID`. You can also pass them as `--private-key`,
-`--deposit-wallet`, and `--chain-id`. Use chain id `137` for Polygon or `80002`
-for Amoy.
+`CHAIN_ID`. You can also pass them as `--private-key`,
+`--deposit-wallet`, and `--chain-id`. Use chain id `137` for Polygon Mainnet.
 
 By default live mode only posts buy orders.
 
@@ -123,9 +122,9 @@ normal discovery selection.
   because Kuest’s order flow uses deposit-wallet signature type, and the
   exchange checks this wallet’s USDC/outcome-token balances.
 
-  --chain-id / KUEST_CHAIN_ID
+  --chain-id / CHAIN_ID
   Required only with --live.
-  Allowed: 137 Polygon, 80002 Amoy. Necessary so signatures are made for
+  Allowed: 137 Polygon Mainnet. Necessary so signatures are made for
   the correct chain and verifying contracts.
 
   --discovery / MARKET_MAKER_DISCOVERY

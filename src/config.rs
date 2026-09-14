@@ -27,7 +27,7 @@ pub struct Cli {
     #[arg(long, env = "KUEST_DEPOSIT_WALLET", hide_env_values = true)]
     pub deposit_wallet: Option<String>,
 
-    #[arg(long, env = "KUEST_CHAIN_ID")]
+    #[arg(long, env = "CHAIN_ID")]
     pub chain_id: Option<ChainId>,
 
     #[arg(long, env = "MARKET_MAKER_DISCOVERY", value_enum, default_value_t = DiscoveryMode::Auto)]
@@ -397,9 +397,7 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
             bail!("--live requires KUEST_DEPOSIT_WALLET or --deposit-wallet");
         }
         let Some(chain_id) = cli.chain_id else {
-            bail!(
-                "--live requires KUEST_CHAIN_ID or --chain-id; use 137 for Polygon or 80002 for Amoy"
-            );
+            bail!("--live requires CHAIN_ID or --chain-id; use 137 for Polygon Mainnet");
         };
         if chain_id != POLYGON && chain_id != AMOY {
             bail!("unsupported chain id {chain_id}; SDK supports {POLYGON} and {AMOY}");
