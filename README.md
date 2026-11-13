@@ -20,8 +20,8 @@ maximum, and only tops up when open size falls below the band minimum.
 
 The bundled `vendor/rs-clob-client` must include the Data Orders contract update.
 Open-order reads send both the token and market condition IDs; missing condition IDs
-stop order queries instead of making an unfiltered query. Missing prices stop risk
-accounting, but do not block cancel-all or its verification.
+stop order queries instead of making an unfiltered query. Missing prices skip the whole
+cycle's quoting in the preflight audit, but do not block cancel-all or its verification.
 
 ## Dry Run
 

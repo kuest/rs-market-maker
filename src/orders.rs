@@ -147,7 +147,7 @@ impl RiskBudget {
 
 #[derive(Clone, Debug)]
 struct QuotePlan {
-    condition_id: B256,
+    condition_id: Option<B256>,
     market_key: String,
     market_slug: String,
     question: String,
@@ -175,7 +175,7 @@ struct QuoteBand {
 
 #[derive(Clone, Debug)]
 struct TokenQuote {
-    condition_id: B256,
+    condition_id: Option<B256>,
     token_id: U256,
     outcome: String,
     fair_price: Decimal,
@@ -554,9 +554,7 @@ async fn build_market_token_quotes(
     market: &MarketResponse,
     cli: &Cli,
 ) -> Result<Vec<TokenQuote>> {
-    let condition_id = market
-        .condition_id
-        .context("market condition ID is required for order queries")?;
+    let condition_id = market.condition_id;
     let mut token_quotes = Vec::new();
 
     for token in &market.tokens {
@@ -578,7 +576,7 @@ async fn build_market_token_quotes(
 
 fn build_token_quote(
     market: &MarketResponse,
-    condition_id: B256,
+    condition_id: Option<B256>,
     token: &Token,
     book: &OrderBookSummaryResponse,
     book_fetched_at: Instant,
@@ -644,7 +642,7 @@ impl OpenBuyCollateral {
 
 fn build_quote_plan(
     market: &MarketResponse,
-    condition_id: B256,
+    condition_id: Option<B256>,
     token: &Token,
     book: &OrderBookSummaryResponse,
     book_fetched_at: Instant,
@@ -1297,9 +1295,10 @@ async fn open_orders_for_token(
 
 async fn priced_open_orders_for_token(
     live: &LiveTrading,
-    condition_id: B256,
+    condition_id: Option<B256>,
     token_id: U256,
 ) -> Result<Vec<PricedOpenOrder>> {
+    let condition_id = condition_id.context("market condition ID is required for order queries")?;
     open_orders_for_token(live, condition_id, token_id)
         .await?
         .into_iter()
@@ -2617,6 +2616,33 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_quotes_do_not_require_condition_id() {
+        let mut cli = test_cli();
+        cli.live = false;
+        let market = order_query_market(None, 1);
+        let book = OrderBookSummaryResponse::builder()
+            .market(Default::default())
+            .asset_id(U256::from(1))
+            .timestamp("2024-01-15T12:34:56Z".parse().unwrap())
+            .bids(vec![level(dec!(0.49), dec!(10))])
+            .asks(vec![level(dec!(0.51), dec!(10))])
+            .min_order_size(dec!(1))
+            .neg_risk(false)
+            .tick_size(dec!(0.01).try_into().unwrap())
+            .build();
+        let quote = build_token_quote(
+            &market,
+            None,
+            &market.tokens[0],
+            &book,
+            Instant::now(),
+            &cli,
+        );
+        assert!(quote.condition_id.is_none());
+        assert!(quote.plan.is_some());
+    }
+
+    #[test]
     fn order_query_includes_condition_and_token_ids() {
         let condition_id = B256::repeat_byte(0x12);
         let request = orders_request(condition_id, U256::from(42));
@@ -3363,7 +3389,7 @@ mod tests {
         let now = Instant::now();
         let cli = test_cli();
         let token_quotes = vec![TokenQuote {
-            condition_id: B256::ZERO,
+            condition_id: Some(B256::ZERO),
             token_id: U256::from(1),
             outcome: "YES".to_owned(),
             fair_price: dec!(0.50),
