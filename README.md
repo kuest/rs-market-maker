@@ -18,6 +18,11 @@ midpoint, then maintain configured quote-size bands around that fair value. The
 bot cancels orders outside the active band, trims excess size above the band
 maximum, and only tops up when open size falls below the band minimum.
 
+The bundled `vendor/rs-clob-client` must include the Data Orders contract update.
+Open-order reads send both the token and market condition IDs; missing condition IDs
+stop order queries instead of making an unfiltered query. Missing prices skip the whole
+cycle's quoting in the preflight audit, but do not block cancel-all or its verification.
+
 ## Dry Run
 
 ```bash
