@@ -9,14 +9,14 @@ use kuest_client_sdk::clob::types::request::{
     BalanceAllowanceRequest, OrderBookSummaryRequest, OrdersRequest, TradesRequest,
 };
 use kuest_client_sdk::clob::types::response::{
-    MarketResponse, OpenOrderResponse, OrderBookSummaryResponse, OrderSummary, PostOrderResponse,
-    Token, TradeResponse,
+    MarketResponse, OpenOrderResponse as RawOpenOrder, OrderBookSummaryResponse, OrderSummary,
+    PostOrderResponse, Token, TradeResponse,
 };
 use kuest_client_sdk::clob::types::{
     AssetType, OrderStatusType, OrderType, Side, SignatureType, SignedOrder, TradeStatusType,
 };
 use kuest_client_sdk::clob::{Client, Config};
-use kuest_client_sdk::types::{Address, Decimal, U256};
+use kuest_client_sdk::types::{Address, B256, Decimal, U256};
 use tokio::time::sleep;
 
 use crate::config::Cli;
@@ -29,6 +29,31 @@ const TERMINAL_CURSOR: &str = "LTE=";
 const CANCEL_ORDER_BATCH_SIZE: usize = 50;
 const CANCEL_VERIFY_ATTEMPTS: usize = 5;
 const CANCEL_VERIFY_DELAY_SECS: u64 = 2;
+
+#[derive(Clone, Debug)]
+struct PricedOpenOrder {
+    response: RawOpenOrder,
+    price: Decimal,
+}
+
+impl TryFrom<RawOpenOrder> for PricedOpenOrder {
+    type Error = anyhow::Error;
+
+    fn try_from(response: RawOpenOrder) -> Result<Self> {
+        let price = response
+            .price
+            .context("open order price is required for risk accounting")?;
+        Ok(Self { response, price })
+    }
+}
+
+impl std::ops::Deref for PricedOpenOrder {
+    type Target = RawOpenOrder;
+
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
 
 pub(crate) struct LiveTrading {
     client: AuthClient,
@@ -91,7 +116,7 @@ impl RiskBudget {
         max_decimal(self.remaining_collateral, Decimal::ZERO)
     }
 
-    fn reserve_open_buy_order(&mut self, order: &OpenOrderResponse) {
+    fn reserve_open_buy_order(&mut self, order: &PricedOpenOrder) {
         if order.side != Side::Buy || self.counted_open_buy_orders.contains_key(&order.id) {
             return;
         }
@@ -102,7 +127,7 @@ impl RiskBudget {
         self.remaining_collateral = max_decimal(self.remaining_collateral - locked, Decimal::ZERO);
     }
 
-    fn release_open_buy_order(&mut self, order: &OpenOrderResponse) {
+    fn release_open_buy_order(&mut self, order: &PricedOpenOrder) {
         if order.side != Side::Buy {
             return;
         }
@@ -122,6 +147,7 @@ impl RiskBudget {
 
 #[derive(Clone, Debug)]
 struct QuotePlan {
+    condition_id: B256,
     market_key: String,
     market_slug: String,
     question: String,
@@ -149,6 +175,7 @@ struct QuoteBand {
 
 #[derive(Clone, Debug)]
 struct TokenQuote {
+    condition_id: B256,
     token_id: U256,
     outcome: String,
     fair_price: Decimal,
@@ -170,7 +197,7 @@ struct LiveTokenState {
     cost_basis: Decimal,
     position_reconcile_error: Option<PositionReconcileError>,
     balance_fetched_at: Instant,
-    open_orders: Vec<OpenOrderResponse>,
+    open_orders: Vec<PricedOpenOrder>,
     open_orders_fetched_at: Instant,
 }
 
@@ -527,6 +554,9 @@ async fn build_market_token_quotes(
     market: &MarketResponse,
     cli: &Cli,
 ) -> Result<Vec<TokenQuote>> {
+    let condition_id = market
+        .condition_id
+        .context("market condition ID is required for order queries")?;
     let mut token_quotes = Vec::new();
 
     for token in &market.tokens {
@@ -538,7 +568,8 @@ async fn build_market_token_quotes(
             .await
             .with_context(|| format!("failed to fetch order book for token {}", token.token_id))?;
         let book_fetched_at = Instant::now();
-        let token_quote = build_token_quote(market, token, &book, book_fetched_at, cli);
+        let token_quote =
+            build_token_quote(market, condition_id, token, &book, book_fetched_at, cli);
         token_quotes.push(token_quote);
     }
 
@@ -547,6 +578,7 @@ async fn build_market_token_quotes(
 
 fn build_token_quote(
     market: &MarketResponse,
+    condition_id: B256,
     token: &Token,
     book: &OrderBookSummaryResponse,
     book_fetched_at: Instant,
@@ -565,7 +597,7 @@ fn build_token_quote(
         None
     };
     let plan = if liquidity_skip.is_none() {
-        build_quote_plan(market, token, book, book_fetched_at, cli)
+        build_quote_plan(market, condition_id, token, book, book_fetched_at, cli)
     } else {
         None
     };
@@ -576,6 +608,7 @@ fn build_token_quote(
     };
 
     TokenQuote {
+        condition_id,
         token_id: token.token_id,
         outcome: token.outcome.clone(),
         fair_price,
@@ -594,7 +627,7 @@ impl OpenBuyCollateral {
         }
     }
 
-    fn reserve_open_buy_order(&mut self, order: &OpenOrderResponse) {
+    fn reserve_open_buy_order(&mut self, order: &PricedOpenOrder) {
         if order.side != Side::Buy || self.reserved_orders.contains_key(&order.id) {
             return;
         }
@@ -611,6 +644,7 @@ impl OpenBuyCollateral {
 
 fn build_quote_plan(
     market: &MarketResponse,
+    condition_id: B256,
     token: &Token,
     book: &OrderBookSummaryResponse,
     book_fetched_at: Instant,
@@ -664,6 +698,7 @@ fn build_quote_plan(
     }
 
     Some(QuotePlan {
+        condition_id,
         market_key: market_key(market),
         market_slug: market.market_slug.clone(),
         question: market.question.clone(),
@@ -926,7 +961,7 @@ async fn reconcile_quote_plan(
             .iter()
             .map(|order| order.id.clone())
             .collect::<BTreeSet<_>>();
-        open_orders = open_orders_for_token(live, plan.token_id).await?;
+        open_orders = priced_open_orders_for_token(live, plan.condition_id, plan.token_id).await?;
         let open_orders_fetched_at = Instant::now();
         market_state.replace_open_orders(
             plan.token_id,
@@ -1227,11 +1262,19 @@ async fn reconcile_quote_plan(
     Ok(())
 }
 
+fn orders_request(condition_id: B256, token_id: U256) -> OrdersRequest {
+    OrdersRequest::builder()
+        .market(condition_id)
+        .asset_id(token_id)
+        .build()
+}
+
 async fn open_orders_for_token(
     live: &LiveTrading,
+    condition_id: B256,
     token_id: U256,
-) -> Result<Vec<OpenOrderResponse>> {
-    let request = OrdersRequest::builder().asset_id(token_id).build();
+) -> Result<Vec<RawOpenOrder>> {
+    let request = orders_request(condition_id, token_id);
     let mut cursor = None;
     let mut orders = Vec::new();
 
@@ -1250,6 +1293,18 @@ async fn open_orders_for_token(
     }
 
     Ok(orders)
+}
+
+async fn priced_open_orders_for_token(
+    live: &LiveTrading,
+    condition_id: B256,
+    token_id: U256,
+) -> Result<Vec<PricedOpenOrder>> {
+    open_orders_for_token(live, condition_id, token_id)
+        .await?
+        .into_iter()
+        .map(PricedOpenOrder::try_from)
+        .collect()
 }
 
 async fn trades_for_token(
@@ -1314,15 +1369,15 @@ pub(crate) async fn cancel_open_orders_for_markets(
     live: &LiveTrading,
     markets: &[MarketResponse],
 ) -> Result<CancelOpenOrdersSummary> {
-    let token_ids = managed_token_ids(markets);
+    let token_ids = managed_token_scopes(markets)?;
     let mut summary = CancelOpenOrdersSummary {
         markets_checked: markets.len(),
         tokens_checked: token_ids.len(),
         ..Default::default()
     };
 
-    for token_id in &token_ids {
-        let open_orders = open_orders_for_token(live, *token_id).await?;
+    for (condition_id, token_id) in &token_ids {
+        let open_orders = open_orders_for_token(live, *condition_id, *token_id).await?;
         if open_orders.is_empty() {
             continue;
         }
@@ -1375,22 +1430,31 @@ pub(crate) async fn cancel_open_orders_for_markets(
     Ok(summary)
 }
 
-fn managed_token_ids(markets: &[MarketResponse]) -> Vec<U256> {
-    let mut token_ids = Vec::new();
+fn managed_token_scopes(markets: &[MarketResponse]) -> Result<Vec<(B256, U256)>> {
+    let mut scopes = Vec::new();
     for market in markets {
+        let condition_id = market
+            .condition_id
+            .context("market condition ID is required for order queries")?;
         for token in &market.tokens {
-            if !token_ids.contains(&token.token_id) {
-                token_ids.push(token.token_id);
+            let scope = (condition_id, token.token_id);
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
             }
         }
     }
-    token_ids
+    Ok(scopes)
 }
 
-async fn remaining_open_orders_for_tokens(live: &LiveTrading, token_ids: &[U256]) -> Result<usize> {
+async fn remaining_open_orders_for_tokens(
+    live: &LiveTrading,
+    token_ids: &[(B256, U256)],
+) -> Result<usize> {
     let mut remaining = 0;
-    for token_id in token_ids {
-        remaining += open_orders_for_token(live, *token_id).await?.len();
+    for (condition_id, token_id) in token_ids {
+        remaining += open_orders_for_token(live, *condition_id, *token_id)
+            .await?
+            .len();
     }
     Ok(remaining)
 }
@@ -1423,7 +1487,9 @@ impl LiveMarketState {
                 ledger_position,
                 cli.position_reconcile_tolerance,
             );
-            let open_orders = open_orders_for_token(live, token_quote.token_id).await?;
+            let open_orders =
+                priced_open_orders_for_token(live, token_quote.condition_id, token_quote.token_id)
+                    .await?;
             let open_orders_fetched_at = Instant::now();
             tokens.push(LiveTokenState {
                 token_id: token_quote.token_id,
@@ -1448,7 +1514,7 @@ impl LiveMarketState {
         })
     }
 
-    fn open_orders(&self, token_id: U256) -> Result<&[OpenOrderResponse]> {
+    fn open_orders(&self, token_id: U256) -> Result<&[PricedOpenOrder]> {
         Ok(&self.token_state(token_id)?.open_orders)
     }
 
@@ -1459,7 +1525,7 @@ impl LiveMarketState {
     fn replace_open_orders(
         &mut self,
         token_id: U256,
-        open_orders: Vec<OpenOrderResponse>,
+        open_orders: Vec<PricedOpenOrder>,
         fetched_at: Instant,
     ) -> Result<()> {
         let token_state = self.token_state_mut(token_id)?;
@@ -1468,7 +1534,7 @@ impl LiveMarketState {
         Ok(())
     }
 
-    fn remove_pending_orders_now_open(&mut self, open_orders: &[OpenOrderResponse]) {
+    fn remove_pending_orders_now_open(&mut self, open_orders: &[PricedOpenOrder]) {
         self.pending_orders.retain(|pending_order| {
             !open_orders
                 .iter()
@@ -1800,7 +1866,7 @@ fn token_cost_basis(
 
 fn token_long_inventory(
     balance: Decimal,
-    open_orders: &[OpenOrderResponse],
+    open_orders: &[PricedOpenOrder],
     pending_orders: &[ProposedOrder],
     staged_orders: &[PlannedOrder],
     token_id: U256,
@@ -1811,7 +1877,7 @@ fn token_long_inventory(
         + staged_buy_size_for_token(staged_orders, token_id)
 }
 
-fn buy_order_size_for_token(orders: &[OpenOrderResponse], token_id: U256) -> Decimal {
+fn buy_order_size_for_token(orders: &[PricedOpenOrder], token_id: U256) -> Decimal {
     orders
         .iter()
         .filter(|order| order.asset_id == token_id && order.side == Side::Buy)
@@ -1905,8 +1971,8 @@ async fn cancel_risk_increasing_orders(
     live: &LiveTrading,
     plan: &QuotePlan,
     cli: &Cli,
-    open_orders: &[&OpenOrderResponse],
-) -> Result<Option<Vec<OpenOrderResponse>>> {
+    open_orders: &[&PricedOpenOrder],
+) -> Result<Option<Vec<PricedOpenOrder>>> {
     let order_ids = open_orders
         .iter()
         .filter(|order| order.side == Side::Buy)
@@ -1938,7 +2004,9 @@ async fn cancel_risk_increasing_orders(
         response.not_canceled.len()
     );
 
-    Ok(Some(open_orders_for_token(live, plan.token_id).await?))
+    Ok(Some(
+        priced_open_orders_for_token(live, plan.condition_id, plan.token_id).await?,
+    ))
 }
 
 async fn cancel_risk_increasing_market_orders(
@@ -2137,10 +2205,10 @@ async fn conditional_balance(live: &LiveTrading, token_id: U256) -> Result<Decim
 }
 
 fn cancellable_orders<'a>(
-    open_orders: &'a [OpenOrderResponse],
+    open_orders: &'a [PricedOpenOrder],
     plan: &QuotePlan,
     cli: &Cli,
-) -> Vec<&'a OpenOrderResponse> {
+) -> Vec<&'a PricedOpenOrder> {
     if !cli.cancel_before_quote {
         return Vec::new();
     }
@@ -2205,7 +2273,7 @@ fn cancellable_orders<'a>(
     cancellable
 }
 
-fn order_should_cancel(order: &OpenOrderResponse, plan: &QuotePlan) -> bool {
+fn order_should_cancel(order: &PricedOpenOrder, plan: &QuotePlan) -> bool {
     if open_order_remaining_size(order) <= Decimal::ZERO {
         return true;
     }
@@ -2238,11 +2306,11 @@ impl QuoteBand {
         }
     }
 
-    fn includes_order(&self, order: &OpenOrderResponse) -> bool {
+    fn includes_order(&self, order: &PricedOpenOrder) -> bool {
         order.side == self.side && self.contains_price(order.price)
     }
 
-    fn cancel_priority(&self, order: &OpenOrderResponse) -> Decimal {
+    fn cancel_priority(&self, order: &PricedOpenOrder) -> Decimal {
         match self.side {
             Side::Buy => max_decimal(self.max_price - order.price, Decimal::ZERO),
             Side::Sell => max_decimal(order.price - self.min_price, Decimal::ZERO),
@@ -2251,7 +2319,7 @@ impl QuoteBand {
     }
 }
 
-fn band_open_size(orders: &[&OpenOrderResponse], band: &QuoteBand) -> Decimal {
+fn band_open_size(orders: &[&PricedOpenOrder], band: &QuoteBand) -> Decimal {
     orders
         .iter()
         .filter(|order| band.includes_order(order))
@@ -2263,7 +2331,7 @@ fn band_missing_size(band: &QuoteBand, open_size: Decimal) -> Option<Decimal> {
     (open_size < band.min_size).then(|| max_decimal(band.avg_size - open_size, Decimal::ZERO))
 }
 
-fn open_order_remaining_size(order: &OpenOrderResponse) -> Decimal {
+fn open_order_remaining_size(order: &PricedOpenOrder) -> Decimal {
     max_decimal(order.original_size - order.size_matched, Decimal::ZERO)
 }
 
@@ -2332,7 +2400,7 @@ fn price_move_reject_reason(
     })
 }
 
-fn is_open_order(order: &OpenOrderResponse) -> bool {
+fn is_open_order(order: &RawOpenOrder) -> bool {
     matches!(
         order.status,
         OrderStatusType::Live | OrderStatusType::Unmatched | OrderStatusType::Delayed
@@ -2359,7 +2427,8 @@ async fn apply_post_responses(
     }
 
     if has_failed_response {
-        let refreshed_orders = open_orders_for_token(live, plan.token_id).await?;
+        let refreshed_orders =
+            priced_open_orders_for_token(live, plan.condition_id, plan.token_id).await?;
         let open_orders_fetched_at = Instant::now();
         market_state.remove_pending_orders_now_open(&refreshed_orders);
         market_state.replace_open_orders(
@@ -2480,7 +2549,7 @@ fn stale_input_reason(
     })
 }
 
-fn open_order_matches_proposed(order: &OpenOrderResponse, proposed_order: ProposedOrder) -> bool {
+fn open_order_matches_proposed(order: &PricedOpenOrder, proposed_order: ProposedOrder) -> bool {
     order.asset_id == proposed_order.token_id
         && order.side == proposed_order.side
         && order.price == proposed_order.price
@@ -2511,6 +2580,70 @@ mod tests {
     use crate::config::{DiscoveryMode, QuoteSides};
 
     use super::*;
+
+    fn order_query_market(condition_id: Option<B256>, token_id: u64) -> MarketResponse {
+        serde_json::from_value(serde_json::json!({
+            "enable_order_book": true, "active": true, "closed": false,
+            "archived": false, "accepting_orders": true,
+            "minimum_order_size": "1", "minimum_tick_size": "0.01",
+            "condition_id": condition_id, "question": "Test", "description": "",
+            "market_slug": "different-from-condition-id", "seconds_delay": 0,
+            "maker_base_fee": "0", "taker_base_fee": "0", "notifications_enabled": false,
+            "neg_risk": false, "icon": "", "image": "",
+            "rewards": {"rates": null, "min_size": "0", "max_spread": "0"},
+            "is_50_50_outcome": false,
+            "tokens": [{"token_id": token_id.to_string(), "outcome": "YES", "price": "0.5"}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn unpriced_open_order_remains_cancellable_but_is_rejected_for_risk() {
+        let mut response = open_order(
+            "test",
+            ProposedOrder {
+                token_id: U256::from(1),
+                side: Side::Buy,
+                price: dec!(0.5),
+                size: Decimal::ONE,
+            },
+        )
+        .response;
+        response.price = None;
+        let orders: Vec<_> = vec![response].into_iter().filter(is_open_order).collect();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].id, "test");
+        assert!(PricedOpenOrder::try_from(orders.into_iter().next().unwrap()).is_err());
+    }
+
+    #[test]
+    fn order_query_includes_condition_and_token_ids() {
+        let condition_id = B256::repeat_byte(0x12);
+        let request = orders_request(condition_id, U256::from(42));
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["market"], condition_id.to_string());
+        assert_eq!(value["asset_id"], "42");
+    }
+
+    #[test]
+    fn cancellation_scopes_preserve_market_token_pairs() {
+        let first = B256::repeat_byte(0x12);
+        let second = B256::repeat_byte(0x34);
+        let markets = [
+            order_query_market(Some(first), 1),
+            order_query_market(Some(second), 2),
+            order_query_market(Some(first), 1),
+        ];
+        assert_eq!(
+            managed_token_scopes(&markets).unwrap(),
+            vec![(first, U256::from(1)), (second, U256::from(2))]
+        );
+    }
+
+    #[test]
+    fn cancellation_scope_rejects_missing_condition_id() {
+        assert!(managed_token_scopes(&[order_query_market(None, 1)]).is_err());
+    }
 
     #[test]
     fn buy_top_up_skip_does_not_reserve_collateral() {
@@ -2644,7 +2777,7 @@ mod tests {
         audit.reserve_open_buy_order(&order);
         let mut budget = RiskBudget::with_open_buy_collateral(dec!(10), audit);
 
-        order.size_matched = dec!(2);
+        order.response.size_matched = dec!(2);
         budget.release_open_buy_order(&order);
 
         assert_eq!(budget.remaining_collateral(), dec!(10));
@@ -3230,6 +3363,7 @@ mod tests {
         let now = Instant::now();
         let cli = test_cli();
         let token_quotes = vec![TokenQuote {
+            condition_id: B256::ZERO,
             token_id: U256::from(1),
             outcome: "YES".to_owned(),
             fair_price: dec!(0.50),
@@ -3251,8 +3385,8 @@ mod tests {
         OrderSummary::builder().price(price).size(size).build()
     }
 
-    fn open_order(id: &str, proposed_order: ProposedOrder) -> OpenOrderResponse {
-        OpenOrderResponse::builder()
+    fn open_order(id: &str, proposed_order: ProposedOrder) -> PricedOpenOrder {
+        RawOpenOrder::builder()
             .id(id)
             .status(OrderStatusType::Live)
             .owner("01HAAAAAAAAAAAAAAAAAAAAAAAAA")
@@ -3263,12 +3397,13 @@ mod tests {
             .original_size(proposed_order.size)
             .size_matched(Decimal::ZERO)
             .price(proposed_order.price)
-            .associate_trades(Vec::new())
             .outcome("YES")
             .created_at("2024-01-15T12:34:56Z".parse().unwrap())
             .expiration("2024-01-20T00:00:00Z".parse().unwrap())
             .order_type(OrderType::GTC)
             .build()
+            .try_into()
+            .unwrap()
     }
 
     fn post_response(success: bool) -> PostOrderResponse {
